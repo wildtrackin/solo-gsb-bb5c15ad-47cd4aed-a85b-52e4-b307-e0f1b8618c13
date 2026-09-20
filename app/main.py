@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from .allocation import AllocationPlanError, plan_allocation
 from .batch import validate_batch
 from .chunk import ChunkValidateError, validate_chunk
+from .contamination import ContaminationTraceError, trace_contamination
 from .exposure import ExposureAuditError, audit_exposure
 from .handover import HandoverPlanAuditError, audit_handover_plan
 from .models import (
@@ -15,6 +16,8 @@ from .models import (
     BatchValidateResponse,
     ChunkValidateRequest,
     ChunkValidateResponse,
+    ContaminationTraceRequest,
+    ContaminationTraceResponse,
     ExposureAuditRequest,
     ExposureAuditResponse,
     HandoverPlanAuditRequest,
@@ -33,7 +36,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -171,4 +174,27 @@ def allocation_plan(request: AllocationPlanRequest) -> AllocationPlanResponse:
     try:
         return plan_allocation(request)
     except AllocationPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/contamination-trace",
+    response_model=ContaminationTraceResponse,
+    tags=["seal-chain"],
+    summary="污染传播溯源：跨链接触级联的最早污染时刻与传播路径",
+)
+def contamination_trace(request: ContaminationTraceRequest) -> ContaminationTraceResponse:
+    """逐链复用单链校验（各链结果原样保留）；仅以 status=ok 的
+    seal/reseal/handover 生成各链保管人半开持有区间 [start,end)（末个区间
+    延伸至 audit_until）。两条链在同一保管人名下区间重叠即形成接触；污染源链
+    自 contaminated_at 起被污染，污染只能在源已污染且接触仍在持续的最早时刻
+    max(源污染时刻, 接触起点) 沿接触向前传播（该时刻须早于接触终点），按
+    (污染时刻, chain_id) 时间优先队列级联计算各链 earliest_contaminated_at；
+    直接来源在级联定序后回放确定（同一最早时刻并列时按 chain_id 字典序固定），
+    完整传播路径沿直接来源回溯至污染源；审计截止前未到达的链列入 unreached。
+    混用时区、污染源 chain_id 未知或 audit_until 早于任一有效事件 /
+    contaminated_at 时返回 422。"""
+    try:
+        return trace_contamination(request)
+    except ContaminationTraceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；并提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）；并提供**污染传播溯源**接口，以各链有效事件生成保管人持有区间，把同一保管人名下的跨链区间重叠识别为接触，从污染源出发按"源已污染且接触仍在持续的最早时刻"级联计算每条链的最早污染时刻、直接来源与完整传播路径。
 
 ## 校验规则（状态机）
 
@@ -810,6 +810,153 @@ curl -s http://localhost:8000/api/v1/seal-chain/allocation-plan \
 # expires_at 不带时区、use_at 带时区：混用时区返回 422
 ```
 
+### `POST /api/v1/seal-chain/contamination-trace`
+
+污染传播溯源。在单链状态机校验的基础上，回答"**污染沿保管人接触链最远传播到哪些展品、各自最早何时被污染**"。处理分五步：
+
+1. **逐链复用单链校验**：对请求中的 `chains` 分别执行与 `/validate` 完全相同的校验，各链原校验结果（附 `chain_id`）原样保留在响应 `chains` 中；
+2. **生成保管人持有区间**：仅以各链 `status = ok` 的 **seal / reseal / handover** 事件——每个有效事件以其时间戳开启对应保管人的半开区间 `[start, end)`，下一个有效事件闭合前一区间，末个区间向右延伸至 `audit_until`；unseal 不改变保管人，违规事件一律不产生区间；
+3. **识别接触**：两条链的展品在**同一保管人名下**区间重叠（半开区间相交）即形成一次接触，接触窗口为重叠部分 `[max(start), min(end))`；
+4. **级联传播**：污染源链自 `contaminated_at` 起被污染；污染只能沿接触**向前**传播——若链 A 在 `tA` 已被污染，且与链 B 存在接触窗口 `[c1, c2)`，则 B 在 `max(tA, c1)` 时刻被污染，前提是该时刻**接触仍在持续**（严格早于 `c2`）。按 (污染时刻, `chain_id`) 时间优先队列级联计算每条链的 `earliest_contaminated_at`；
+5. **确定直接来源与路径**：直接来源在级联定序后回放确定——在已定序且能在该链最早污染时刻送达污染的链中取 `chain_id` 字典序最小者（**同一最早时刻并列时据此固定结果**）；`path` 沿直接来源回溯至污染源，给出完整传播路径。审计截止前未被污染到达的链单独列入 `unreached`。
+
+- `chains[]`：事件链，结构同 `/batch-validate`；`chain_id` 不可重复（重复返回 `422`），允许空列表
+- `source`：污染源，`chain_id` 必须出现在 `chains` 中（否则 `422`），`contaminated_at` 为源链展品被污染的时刻
+- `audit_until`：审计截止时间；**早于任一有效事件时间或 `contaminated_at` 时返回 `422`**（违规事件不推进有效时间基准）
+- 事件、`source` 与 `audit_until` 的时间不得混用带时区与不带时区的时间（否则 `422`）；链本身存在状态机违规**不影响**本接口返回 `200`，违规只体现在 `chains` 的各链校验结果中
+
+**请求体**
+
+```json
+{
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-19T08:00:00Z", "seal_id": "S001", "custodian": "Alice"}
+      ]
+    },
+    {
+      "chain_id": "chain-b",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-19T09:00:00Z", "seal_id": "S002", "custodian": "Alice"},
+        {"type": "handover", "timestamp": "2026-09-19T10:00:00Z", "custodian": "Bob"}
+      ]
+    },
+    {
+      "chain_id": "chain-c",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-19T10:30:00Z", "seal_id": "S003", "custodian": "Bob"}
+      ]
+    },
+    {
+      "chain_id": "chain-d",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-19T11:00:00Z", "seal_id": "S004", "custodian": "Carol"}
+      ]
+    }
+  ],
+  "source": {"chain_id": "chain-a", "contaminated_at": "2026-09-19T09:30:00Z"},
+  "audit_until": "2026-09-19T20:00:00Z"
+}
+```
+
+**响应示例**（对应上例：chain-a 与 chain-b 在 Alice 名下接触 `[09:00,10:00)`，源 09:30 已污染 → chain-b 在 09:30 被污染；chain-b 与 chain-c 在 Bob 名下接触 `[10:30,20:00)` → chain-c 在 10:30 被污染；chain-d 无接触未到达）
+
+```json
+{
+  "audit_until": "2026-09-19T20:00:00Z",
+  "source": {"chain_id": "chain-a", "contaminated_at": "2026-09-19T09:30:00Z"},
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Alice",
+      "current_seal": "S001",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    },
+    {
+      "chain_id": "chain-b",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Bob",
+      "current_seal": "S002",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+        {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    },
+    {
+      "chain_id": "chain-c",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Bob",
+      "current_seal": "S003",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    },
+    {
+      "chain_id": "chain-d",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Carol",
+      "current_seal": "S004",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+      ],
+      "violations": []
+    }
+  ],
+  "contaminated": [
+    {"chain_id": "chain-a", "earliest_contaminated_at": "2026-09-19T09:30:00Z",
+     "direct_source": null, "path": ["chain-a"]},
+    {"chain_id": "chain-b", "earliest_contaminated_at": "2026-09-19T09:30:00Z",
+     "direct_source": "chain-a", "path": ["chain-a", "chain-b"]},
+    {"chain_id": "chain-c", "earliest_contaminated_at": "2026-09-19T10:30:00Z",
+     "direct_source": "chain-b", "path": ["chain-a", "chain-b", "chain-c"]}
+  ],
+  "unreached": ["chain-d"]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `audit_until` / `source` | 回显请求中的审计截止时间与污染源 |
+| `chains[]` | 各链原单链校验结果（结构同 `/validate`，附 `chain_id`），按**输入顺序**返回；溯源仅采用其中 `status=ok` 的 seal/reseal/handover |
+| `contaminated[]` | 被污染的链（含污染源本身），按 (最早污染时刻, `chain_id`) 升序 |
+| `contaminated[].earliest_contaminated_at` | 该链展品最早被污染的时刻 |
+| `contaminated[].direct_source` | 直接来源链标识（同一最早时刻并列时按 `chain_id` 字典序确定）；污染源本身为 `null` |
+| `contaminated[].path` | 完整传播路径：从污染源链到本链的 `chain_id` 序列（两端均含） |
+| `unreached[]` | 审计截止前未被污染到达的链标识，按 `chain_id` 字典序排列 |
+
+### 污染传播溯源接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/contamination-trace \
+  -H 'Content-Type: application/json' \
+  -d '{"chains": [
+        {"chain_id": "chain-a", "events": [
+          {"type": "seal", "timestamp": "2026-09-19T08:00:00Z",
+           "seal_id": "S001", "custodian": "Alice"}
+        ]},
+        {"chain_id": "chain-b", "events": [
+          {"type": "seal", "timestamp": "2026-09-19T09:00:00Z",
+           "seal_id": "S002", "custodian": "Alice"}
+        ]}
+      ],
+      "source": {"chain_id": "chain-a", "contaminated_at": "2026-09-19T10:00:00Z"},
+      "audit_until": "2026-09-19T20:00:00Z"}'
+# Alice 名下接触 [09:00,20:00)，源 10:00 已污染且接触仍在持续：
+# chain-b 在 10:00 被污染，path = ["chain-a", "chain-b"]
+```
+
 > 服务默认监听宿主机 **8000** 端口（容器内固定 `0.0.0.0:8000`，可用 `HOST_PORT` 覆盖），以上示例中的 `http://localhost:8000` 即该端口。
 
 ## 本地开发与测试
@@ -825,7 +972,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验与库存分配规划）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验、库存分配规划与污染传播溯源）
   validator.py   # 单链状态机校验核心
   timeline.py    # 时间线公共层（status=ok 事件过滤并保留全链下标 / 半开区间 covered-gap 分割 / 时区可比性检查）
   batch.py       # 批量封签占用检查（跨链冲突）
@@ -835,6 +982,7 @@ app/
   temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总，复用 timeline 公共层）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
   allocation.py  # 封签库存分配规划（占用排除 / 候选边 / 全局最优分配动态规划）
+  contamination.py # 污染传播溯源（保管人持有区间 / 接触识别 / 级联最早污染时刻与传播路径，复用 timeline 公共层）
 tests/
   test_validator.py
   test_batch.py
@@ -845,6 +993,7 @@ tests/
   test_timeline.py
   test_chunk.py
   test_allocation.py
+  test_contamination.py
 Dockerfile
 docker-compose.yml
 requirements.txt

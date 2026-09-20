@@ -651,3 +651,71 @@ class AllocationPlanResponse(BaseModel):
         description="每条待用记录的分配结果，按请求 pending 顺序"
     )
     summary: AllocationSummary = Field(description="分配结果汇总")
+
+
+# ---------------------------------------------------------------------------
+# 污染传播溯源（/api/v1/seal-chain/contamination-trace）
+# ---------------------------------------------------------------------------
+
+
+class ContaminationSource(BaseModel):
+    """污染源：某条链的展品自 contaminated_at 起已被污染。"""
+
+    chain_id: str = Field(description="污染源所在链标识，必须出现在 chains 中")
+    contaminated_at: datetime = Field(description="源链展品被污染的时刻（ISO 8601）")
+
+
+class ContaminationTraceRequest(BaseModel):
+    """污染传播溯源请求：多条带 chain_id 的事件链、污染源与审计截止时间。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；chain_id 不可重复",
+    )
+    source: ContaminationSource = Field(description="污染源（chain_id + contaminated_at）")
+    audit_until: datetime = Field(
+        description="审计截止时间；各链末个持有区间延伸至此，"
+        "不得早于任一有效事件时间或 contaminated_at"
+    )
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "ContaminationTraceRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        return self
+
+
+class ContaminatedChainResult(BaseModel):
+    """一条被污染链的溯源结果。"""
+
+    chain_id: str = Field(description="被污染链标识")
+    earliest_contaminated_at: datetime = Field(description="该链展品最早被污染的时刻")
+    direct_source: Optional[str] = Field(
+        description="直接来源链标识（同一最早时刻并列时按 chain_id 字典序确定）；"
+        "污染源本身为 null"
+    )
+    path: List[str] = Field(
+        description="完整传播路径：从污染源链到本链的 chain_id 序列（两端均含）"
+    )
+
+
+class ContaminationTraceResponse(BaseModel):
+    """污染传播溯源响应：保留各链单链校验结果，另附级联溯源明细。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    source: ContaminationSource = Field(description="回显请求中的污染源")
+    chains: List[BatchChainResult] = Field(
+        description="各链原单链校验结果（按输入顺序，结构同单链接口并附 chain_id）；"
+        "仅以其中 status=ok 的 seal/reseal/handover 生成保管人持有区间"
+    )
+    contaminated: List[ContaminatedChainResult] = Field(
+        default_factory=list,
+        description="被污染的链（含污染源本身），按 (最早污染时刻, chain_id) 升序",
+    )
+    unreached: List[str] = Field(
+        default_factory=list,
+        description="审计截止前未被污染到达的链标识，按 chain_id 字典序排列",
+    )
