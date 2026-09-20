@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；并提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致；并提供**封签库存分配规划**接口，复用批量校验排除已占用编号后，在"未过期且保管人允许"的候选边上做一对一全局最优分配（最大化满足记录数、最小化过期余量总秒数、按待用记录输入顺序与封签编号字典序确定唯一方案）；提供**污染接触溯源**接口，复用单链校验并仅以有效 seal/reseal/handover 生成各展品按保管人的半开持有区间，两条展品在同一保管人名下区间重叠即形成接触，以 Dijkstra 级联计算每条链的最早污染时刻、直接来源与完整传播路径，同一最早时刻并列时按 chain_id 字典序固定结果。
 
 ## 校验规则（状态机）
 
@@ -810,6 +810,148 @@ curl -s http://localhost:8000/api/v1/seal-chain/allocation-plan \
 # expires_at 不带时区、use_at 带时区：混用时区返回 422
 ```
 
+### `POST /api/v1/seal-chain/contamination-trace`
+
+污染接触溯源。在多条展品事件链之上，回答“**某展品被污染后，污染会经由哪些共同保管人、在什么时刻级联传到哪些展品**”。处理分四步：
+
+1. **复用单链校验**：对请求中的每条链分别调用现有状态机校验器，原始结果原样保留在各链结果的 `validation`（结构同 `/validate`）；链自身存在状态机违规**不影响**审计接口返回 `200`；
+2. **生成持有区间**：仅以各链 `validation.events` 中 `status = ok` 的 **seal / reseal / handover** 事件，生成“展品按保管人”的半开持有区间 `[start, end)`——每个有效事件以其时间戳开启对应保管人的区间，下一个有效事件闭合前一区间，最后一个区间向右开放并在 `audit_until` 处截断；unseal 不改变保管人，违规事件一律不产生区间；
+3. **识别接触**：两条**不同**链（展品）在**同一保管人**名下的持有区间存在正长度重叠（半开语义：`max(start) < min(end)`，仅首尾相接不算接触）时形成一次接触，接触段为 `[contact_start, contact_end)`；
+4. **级联传播**：污染源链自 `contaminated_at` 起被污染；沿一次接触 u → v，污染只能在**源已污染且接触仍在持续的最早时刻** `max(u.earliest_contaminated_at, contact_start)` 向前传播，且该时刻必须严格落在接触段内（`< contact_end`）、不晚于 `audit_until`。以带优先队列的 Dijkstra（时间越早越优）级联计算每条链的 `earliest_contaminated_at` 与直接来源链，并回溯得到从源头到该链的**完整传播路径**（逐跳含保管人、接触段与发生时刻）。
+
+**并列固定规则**：同一目标链可在同一最早时刻经多条传播路径到达时，按传播路径的 `chain_id` 序列（先比较源头 `chain_id`，源头相同再逐跳向后比较）**字典序最小**者固定唯一结果——即同刻并列时源头（进而每一跳）`chain_id` 字典序更小的路径胜出，结果与请求中链、源的输入顺序无关。该规则天然无环，回溯总能到达某个污染源。污染源链以其声明的 `contaminated_at` 为准，不被任何传入传播改写。
+
+- `chains[]`：多条带 `chain_id` 的事件链，结构同 `/batch-validate`；`chain_id` 不可重复（重复返回 `422`），允许空列表。
+- `sources[]`：污染源列表，每项含 `chain_id`（必须出现在 `chains` 中，未知返回 `422`；同一链重复声明返回 `422`）与 `contaminated_at`（该展品开始被污染的时刻）；允许空列表，表示无任何污染。
+- `audit_until`：审计截止时间。污染仅统计到该时刻（传播时刻恰为 `audit_until` 不计），开放持有区间在此截断；**早于任一链最后一个有效事件时间时返回 `422`**（恰好相等允许；违规事件不推进有效时间基准）。
+- 事件时间戳、`contaminated_at` 与 `audit_until` **不得混用带时区与不带时区的时间**（否则 `422`）。
+- 截至 `audit_until` 未被污染到达的链（包括与任何污染源都无接触通路者）在各自结果中 `reached = false`，并单独汇总到按 `chain_id` 字典序排列的 `not_reached_chain_ids`。
+
+**请求体**
+
+```json
+{
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T08:00:00Z", "seal_id": "S001", "custodian": "Alice"}
+      ]
+    },
+    {
+      "chain_id": "chain-b",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T09:00:00Z", "seal_id": "S002", "custodian": "Alice"},
+        {"type": "handover", "timestamp": "2026-09-20T11:00:00Z", "custodian": "Bob"}
+      ]
+    },
+    {
+      "chain_id": "chain-c",
+      "events": [
+        {"type": "seal", "timestamp": "2026-09-20T11:30:00Z", "seal_id": "S003", "custodian": "Bob"}
+      ]
+    }
+  ],
+  "sources": [
+    {"chain_id": "chain-a", "contaminated_at": "2026-09-20T10:00:00Z"}
+  ],
+  "audit_until": "2026-09-20T20:00:00Z"
+}
+```
+
+**响应示例**（对应上例：A 于 10:00 在 Alice 处污染 B；B 11:00 交给 Bob，C 11:30 在 Bob 处与 B 接触，故 C 于 11:30 经 B 污染）
+
+```json
+{
+  "audit_until": "2026-09-20T20:00:00Z",
+  "chains": [
+    {
+      "chain_id": "chain-a",
+      "reached": true,
+      "is_source": true,
+      "earliest_contaminated_at": "2026-09-20T10:00:00Z",
+      "direct_source_chain_id": null,
+      "path": [],
+      "validation": {"valid": true, "sealed": true, "final_custodian": "Alice",
+                     "current_seal": "S001", "events": ["..."], "violations": []}
+    },
+    {
+      "chain_id": "chain-b",
+      "reached": true,
+      "is_source": false,
+      "earliest_contaminated_at": "2026-09-20T10:00:00Z",
+      "direct_source_chain_id": "chain-a",
+      "path": [
+        {"from_chain_id": "chain-a", "to_chain_id": "chain-b", "custodian": "Alice",
+         "contact_start": "2026-09-20T09:00:00Z", "contact_end": "2026-09-20T11:00:00Z",
+         "contaminated_at": "2026-09-20T10:00:00Z",
+         "from_event_index": 0, "to_event_index": 0}
+      ],
+      "validation": {"valid": true, "sealed": true, "final_custodian": "Bob",
+                     "current_seal": "S002", "events": ["..."], "violations": []}
+    },
+    {
+      "chain_id": "chain-c",
+      "reached": true,
+      "is_source": false,
+      "earliest_contaminated_at": "2026-09-20T11:30:00Z",
+      "direct_source_chain_id": "chain-b",
+      "path": [
+        {"from_chain_id": "chain-a", "to_chain_id": "chain-b", "custodian": "Alice",
+         "contact_start": "2026-09-20T09:00:00Z", "contact_end": "2026-09-20T11:00:00Z",
+         "contaminated_at": "2026-09-20T10:00:00Z",
+         "from_event_index": 0, "to_event_index": 0},
+        {"from_chain_id": "chain-b", "to_chain_id": "chain-c", "custodian": "Bob",
+         "contact_start": "2026-09-20T11:30:00Z", "contact_end": "2026-09-20T20:00:00Z",
+         "contaminated_at": "2026-09-20T11:30:00Z",
+         "from_event_index": 1, "to_event_index": 0}
+      ],
+      "validation": {"valid": true, "sealed": true, "final_custodian": "Bob",
+                     "current_seal": "S003", "events": ["..."], "violations": []}
+    }
+  ],
+  "not_reached_chain_ids": [],
+  "summary": {"total": 3, "sources": 1, "contaminated": 3, "not_reached": 0}
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `audit_until` | 回显请求中的审计截止时间 |
+| `chains[]` | 各链溯源结果，按请求 `chains` **输入顺序**返回；每条均附原始单链 `validation` |
+| `chains[].reached` | 截至 `audit_until` 该展品是否已被污染；污染源自身恒为 `true` |
+| `chains[].is_source` | 是否为请求中声明的污染源 |
+| `chains[].earliest_contaminated_at` | 最早污染时刻（污染源为其 `contaminated_at`）；未到达时为 `null` |
+| `chains[].direct_source_chain_id` | 直接污染该链的上一跳链标识；污染源或未到达时为 `null`；同刻并列按传播路径 `chain_id` 序列字典序固定（见上文并列固定规则） |
+| `chains[].path[]` | 完整传播路径，按传播先后排列的各跳；污染源与未到达链为空列表 |
+| `path[].contact_start/end` | 该跳两链在共同保管人名下持有区间的重叠段（半开 `[start, end)`，右端不晚于 `audit_until`） |
+| `path[].contaminated_at` | 该跳污染发生时刻，即 `max(来源链已污染时刻, contact_start)` |
+| `path[].from_event_index/to_event_index` | 两链开启该保管人持有区间的有效事件全链下标（从 0 开始） |
+| `not_reached_chain_ids[]` | 未被污染到达的链标识，按 `chain_id` 字典序排列 |
+| `summary` | `total`（链总数）/ `sources`（污染源数）/ `contaminated`（含污染源的已污染链数）/ `not_reached` |
+
+### 污染接触溯源接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/contamination-trace \
+  -H 'Content-Type: application/json' \
+  -d '{"chains": [
+          {"chain_id": "chain-a", "events": [
+            {"type": "seal", "timestamp": "2026-09-20T08:00:00Z",
+             "seal_id": "S001", "custodian": "Alice"}
+          ]},
+          {"chain_id": "chain-b", "events": [
+            {"type": "seal", "timestamp": "2026-09-20T09:00:00Z",
+             "seal_id": "S002", "custodian": "Alice"}
+          ]}
+        ],
+        "sources": [
+          {"chain_id": "chain-x", "contaminated_at": "2026-09-20T10:00:00Z"}
+        ],
+        "audit_until": "2026-09-20T20:00:00Z"}'
+# 污染源 chain-x 不在 chains 中：返回 422
+```
+
 > 服务默认监听宿主机 **8000** 端口（容器内固定 `0.0.0.0:8000`，可用 `HOST_PORT` 覆盖），以上示例中的 `http://localhost:8000` 即该端口。
 
 ## 本地开发与测试
@@ -825,7 +967,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验与库存分配规划）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验、库存分配规划与污染接触溯源）
   validator.py   # 单链状态机校验核心
   timeline.py    # 时间线公共层（status=ok 事件过滤并保留全链下标 / 半开区间 covered-gap 分割 / 时区可比性检查）
   batch.py       # 批量封签占用检查（跨链冲突）
@@ -835,6 +977,7 @@ app/
   temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总，复用 timeline 公共层）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
   allocation.py  # 封签库存分配规划（占用排除 / 候选边 / 全局最优分配动态规划）
+  contamination.py # 污染接触溯源（按保管人持有区间 / 同保管人接触边 / 级联传播 Dijkstra / 路径回溯）
 tests/
   test_validator.py
   test_batch.py
@@ -845,6 +988,7 @@ tests/
   test_timeline.py
   test_chunk.py
   test_allocation.py
+  test_contamination.py
 Dockerfile
 docker-compose.yml
 requirements.txt

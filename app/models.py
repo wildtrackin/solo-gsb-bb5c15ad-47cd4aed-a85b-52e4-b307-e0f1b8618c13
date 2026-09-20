@@ -651,3 +651,117 @@ class AllocationPlanResponse(BaseModel):
         description="每条待用记录的分配结果，按请求 pending 顺序"
     )
     summary: AllocationSummary = Field(description="分配结果汇总")
+
+
+# ---------------------------------------------------------------------------
+# 污染接触溯源（/api/v1/seal-chain/contamination-trace）
+# ---------------------------------------------------------------------------
+
+
+class ContaminationSource(BaseModel):
+    """污染源：某条链（展品）自 contaminated_at 起已被污染。"""
+
+    chain_id: str = Field(description="污染源链标识，必须出现在请求 chains 中")
+    contaminated_at: datetime = Field(description="该展品开始被污染的时刻（ISO 8601）")
+
+
+class ContaminationTraceRequest(BaseModel):
+    """污染接触溯源请求：多条带 chain_id 的事件链、污染源与审计截止时间。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；仅以各链 status=ok 的 "
+        "seal/reseal/handover 生成保管人持有区间",
+    )
+    sources: List[ContaminationSource] = Field(
+        default_factory=list,
+        description="污染源列表；chain_id 必须全部出现在 chains 中且不可重复"
+    )
+    audit_until: datetime = Field(
+        description="审计截止时间；污染仅统计到该时刻为止，持有区间向右开放端截断至此；"
+        "早于任一链最后一个有效事件时间时返回 422"
+    )
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "ContaminationTraceRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        seen_sources: set[str] = set()
+        for source in self.sources:
+            if source.chain_id in seen_sources:
+                raise ValueError(f"污染源 chain_id 不可重复：{source.chain_id}")
+            seen_sources.add(source.chain_id)
+        return self
+
+
+class ContaminationHop(BaseModel):
+    """污染传播路径上的一跳：在一次同保管人接触中由 from_chain 传给 to_chain。"""
+
+    from_chain_id: str = Field(description="该跳的直接来源链（污染方）")
+    to_chain_id: str = Field(description="该跳的目标链（被污染方）")
+    custodian: str = Field(description="发生接触的共同保管人")
+    contact_start: datetime = Field(description="两链保管人持有区间重叠段起点（含）")
+    contact_end: datetime = Field(description="两链保管人持有区间重叠段终点（不含）")
+    contaminated_at: datetime = Field(
+        description="污染在该跳发生的时刻，即 max(来源链已污染时刻, 接触起点)"
+    )
+    from_event_index: Optional[int] = Field(
+        default=None,
+        description="来源链开启该保管人持有区间的有效事件下标（全链，从 0 开始）",
+    )
+    to_event_index: Optional[int] = Field(
+        default=None,
+        description="目标链开启该保管人持有区间的有效事件下标（全链，从 0 开始）",
+    )
+
+
+class ContaminationChainResult(BaseModel):
+    """单条链的污染溯源结果（按请求 chains 输入顺序返回）。"""
+
+    chain_id: str = Field(description="链标识，回显请求中的 chain_id")
+    reached: bool = Field(
+        description="截至 audit_until 该链（展品）是否已被污染；污染源自身恒为 true"
+    )
+    is_source: bool = Field(description="该链是否在请求 sources 中被声明为污染源")
+    earliest_contaminated_at: Optional[datetime] = Field(
+        description="该链最早被污染的时刻（污染源为其 contaminated_at）；未到达时为 null"
+    )
+    direct_source_chain_id: Optional[str] = Field(
+        description="直接污染该链的上一跳链标识；污染源或未到达时为 null。"
+        "同一最早时刻并列时按传播路径 chain_id 序列字典序（先看源头、再逐跳）固定"
+    )
+    path: List[ContaminationHop] = Field(
+        default_factory=list,
+        description="完整传播路径：从源头链到该链的各跳，按传播先后排列；"
+        "污染源为空列表，未到达亦为空列表",
+    )
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 "
+        "seal/reseal/handover 生成持有区间"
+    )
+
+
+class ContaminationTraceSummary(BaseModel):
+    """污染接触溯源汇总计数。"""
+
+    total: int = Field(description="请求中的链总数")
+    sources: int = Field(description="污染源链数")
+    contaminated: int = Field(description="截至 audit_until 已被污染的链数（含污染源）")
+    not_reached: int = Field(description="未被污染到达的链数")
+
+
+class ContaminationTraceResponse(BaseModel):
+    """污染接触溯源响应：各链最早污染时刻、直接来源与完整传播路径。"""
+
+    audit_until: datetime = Field(description="回显请求中的审计截止时间")
+    chains: List[ContaminationChainResult] = Field(
+        description="各链溯源结果，按请求 chains 输入顺序"
+    )
+    not_reached_chain_ids: List[str] = Field(
+        default_factory=list,
+        description="未被污染到达的链标识，按 chain_id 字典序排列",
+    )
+    summary: ContaminationTraceSummary = Field(description="溯源结果汇总")

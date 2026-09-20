@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from .allocation import AllocationPlanError, plan_allocation
 from .batch import validate_batch
 from .chunk import ChunkValidateError, validate_chunk
+from .contamination import ContaminationTraceError, trace_contamination
 from .exposure import ExposureAuditError, audit_exposure
 from .handover import HandoverPlanAuditError, audit_handover_plan
 from .models import (
@@ -15,6 +16,8 @@ from .models import (
     BatchValidateResponse,
     ChunkValidateRequest,
     ChunkValidateResponse,
+    ContaminationTraceRequest,
+    ContaminationTraceResponse,
     ExposureAuditRequest,
     ExposureAuditResponse,
     HandoverPlanAuditRequest,
@@ -33,7 +36,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -171,4 +174,26 @@ def allocation_plan(request: AllocationPlanRequest) -> AllocationPlanResponse:
     try:
         return plan_allocation(request)
     except AllocationPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/contamination-trace",
+    response_model=ContaminationTraceResponse,
+    tags=["seal-chain"],
+    summary="污染接触溯源：同保管人接触驱动的污染级联传播",
+)
+def contamination_trace(request: ContaminationTraceRequest) -> ContaminationTraceResponse:
+    """复用单链校验，仅以各链 status=ok 的 seal/reseal/handover 生成展品按保管人的
+    半开持有区间（右端在 audit_until 截断）；两条展品在同一保管人名下区间正长度
+    重叠形成接触，污染仅能在源已污染且接触仍在持续的最早时刻沿接触向前传播。
+    以 Dijkstra 级联计算每条链的 earliest_contaminated_at、直接来源链与完整传播
+    路径（逐跳含保管人、接触段与发生时刻）；同一最早时刻并列时按传播路径的
+    chain_id 序列字典序（先看源头、再逐跳）固定唯一结果；截至 audit_until 未到达
+    的链单独按字典序列出。事件、污染源与 audit_until 混用时区、污染源 chain_id
+    未知/重复、chain_id 重复或 audit_until 早于任一链最后一个有效事件时间时
+    返回 422。"""
+    try:
+        return trace_contamination(request)
+    except ContaminationTraceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
